@@ -1,0 +1,195 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Main
+
+
+RWTexture2D<float4> Result;
+Texture3D<float4> _DensityTexture;
+Texture3D<float> _DivergenceTexture;
+Texture3D<float> _PressureTexture;
+SamplerState myLinearClampSampler;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float _density;
+float _shadowAmount;
+
+#define ITERATIONS 128
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+struct AABB {
+    float3 min;
+    float3 max;
+};
+
+bool intersect(Ray r, AABB aabb, out float t0, out float t1)
+{
+    float3 invR = 1.0 / r.direction;
+    float3 tbot = invR * (aabb.min - r.origin);
+    float3 ttop = invR * (aabb.max - r.origin);
+    float3 tmin = min(ttop, tbot);
+    float3 tmax = max(ttop, tbot);
+    float2 t = max(tmin.xx, tmin.yz);
+    t0 = max(t.x, t.y);
+    t = min(tmax.xx, tmax.yz);
+    t1 = min(t.x, t.y);
+    return t0 <= t1;
+}
+
+bool intersection(AABB b, Ray r) {
+    float3 n_inv = 1.0f / r.direction;
+
+    float tx1 = (b.min.x - r.origin.x) * n_inv.x;
+    float tx2 = (b.max.x - r.origin.x) * n_inv.x;
+
+    float tmin = min(tx1, tx2);
+    float tmax = max(tx1, tx2);
+
+    float ty1 = (b.min.y - r.origin.y) * n_inv.y;
+    float ty2 = (b.max.y - r.origin.y) * n_inv.y;
+
+    tmin = max(tmin, min(ty1, ty2));
+    tmax = min(tmax, max(ty1, ty2));
+
+    float tz1 = (b.min.z - r.origin.z) * n_inv.z;
+    float tz2 = (b.max.z - r.origin.z) * n_inv.z;
+
+    tmin = max(tmin, min(tz1, tz2)); 
+    tmax = min(tmax, max(tz1, tz2));
+
+    return tmax >= tmin;
+}
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+float SampleLinear(float3 p)
+{
+    p += 0.5;
+    return _DensityTexture.SampleLevel(myLinearClampSampler, p, 0).a * 30.0;
+}
+
+float SamplePressure(float3 p)
+{
+    p += 0.5;
+    return _PressureTexture.SampleLevel(myLinearClampSampler, p, 0);
+}
+
+float3 SampleVelocity(float3 p)
+{
+    p += 0.5;
+    return _DensityTexture.SampleLevel(myLinearClampSampler, p, 0).xyz;
+}
+
+[numthreads(8,8,1)]
+void Main (uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+    AABB aabb;
+    aabb.min = float3(-0.5, -0.5, -0.5);
+    aabb.max = float3(0.5, 0.5, 0.5);
+ 
+    if (!intersection(aabb, ray)) {
+        Result[id.xy] = float4(0, 0, 0, 1);
+        return;
+    }
+
+    float tnear;
+    float tfar;
+    intersect(ray, aabb, tnear, tfar);
+    tnear = max(0.0, tnear);
+
+    float3 start = ray.origin + ray.direction * tnear;
+    float3 end = ray.origin + ray.direction * tfar;
+    float dist = abs(tfar - tnear); // float dist = distance(start, end);
+    float step_size = 0.01;
+    float3 ds = normalize(end - start) * step_size;
+
+
+    float curdensity = 0;
+    float transmittance = 1;
+    float density = 0;
+    float3 lightenergy = 0;
+
+    float3 p = start;
+    float3 velocityColor = (float3)0.0;
+
+    for (int iter = 0; iter < ITERATIONS; iter++)
+    {
+        float d = SampleLinear(p) * _density;
+        float3 v = SampleVelocity(p);
+        float3 LightVector = float3(-1, 1, 0);
+        //Sample Light Absorption and Scattering
+        if (d > 0.001)
+        {
+            float3 lpos = p;
+            float shadowdist = 0;
+
+            for (int s = 0; s < 10; s++)
+            {
+                lpos += LightVector * step_size;
+                float lsample = SampleLinear(lpos);
+                shadowdist += lsample;
+            }
+          
+            curdensity = saturate(d);
+            float shadowterm = exp(-shadowdist * _shadowAmount);
+            float3 absorbedlight = shadowterm * curdensity;
+            lightenergy += absorbedlight * transmittance;
+            
+            transmittance *= 1 - curdensity;
+
+            density += d * (1.0 / ITERATIONS);
+
+          //  velocityColor += v * (1.0 / ITERATIONS);
+
+        /*    float pressure = SamplePressure(p);
+            if (pressure > 0)
+                velocityColor.r += (1.0 / ITERATIONS) ;
+            else
+                velocityColor.b += (1.0 / ITERATIONS);
+*/
+            velocityColor += abs(v) * (10.0 / ITERATIONS);
+        }
+
+        p += ds;
+
+        if (abs(p.x) > 0.5 || abs(p.y) > 0.5 || abs(p.z) > 0.5)
+            break;
+
+    }
+
+    float3 color = lightenergy;//  *abs(velocityColor);
+    //float3 color = velocityColor;
+
+
+    Result[id.xy] = float4(color, 1.0f);
+}

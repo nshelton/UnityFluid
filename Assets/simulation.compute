@@ -1,0 +1,200 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Init
+#pragma kernel Advect
+#pragma kernel Inject
+#pragma kernel Diffuse
+#pragma kernel Divergence
+#pragma kernel ProjectField
+#pragma kernel Pressure
+#pragma kernel Clear
+#pragma kernel BoundaryCondition
+
+// velocity xyz, density a
+Texture3D<float4> _Source;
+RWTexture3D<float4> _Destination;
+
+Texture3D<float> _SourceDivergence;
+Texture3D<float> _SourcePressure;
+
+RWTexture3D<float> _DestinationDivergence;
+RWTexture3D<float> _DestinationPressure;
+
+SamplerState MyLinearRepeatSampler;
+
+float _dt;
+float _viscosity;
+float3 _decay;
+float _time;
+float _velocity;
+
+int  _resolution;
+
+float4 SampleLinear(float3 p)
+{
+    return _Source.SampleLevel(MyLinearRepeatSampler, p, 0);
+}
+
+
+float3 worldPosFromID(int3 id) 
+{
+    return ((float3)id.xyz + 0.5) / (float)_resolution - 0.5;
+}
+
+float3 NormPosFromID(int3 id)
+{
+    return ((float3)id.xyz + 0.5) / (float)_resolution;
+}
+
+[numthreads(4,4,4)]
+void Init (uint3 id : SV_DispatchThreadID)
+{
+    _Destination[id.xyz] = float4(0, 0, 0, 0);
+}
+
+[numthreads(4, 4, 4)]
+void Advect(uint3 id : SV_DispatchThreadID)
+{
+    float4 thisSample = _Source[id.xyz];
+    float3 velocity = thisSample.xyz;
+
+    float3 pos = NormPosFromID(id);
+    
+     pos -= velocity * _dt;
+ 
+
+     float4 previousSample = SampleLinear(pos);
+
+     previousSample.a *= _decay.y;
+     previousSample.xyz *= _decay.x;
+     _Destination[id.xyz] = previousSample;
+
+}
+
+[numthreads(4, 4, 4)]
+void Inject(uint3 id : SV_DispatchThreadID)
+{
+    float3 pos = worldPosFromID(id);
+    float amount = 0;
+    float3 velocity = float3(0, 0, 0);
+ 
+    if (pos.y > 0.4 && length(pos.xz) < 0.01)
+    {
+        amount = 1;
+        velocity = float3(0,  -_velocity * 10,  10);
+        _Destination[id.xyz] = float4(velocity, amount);
+    }
+    else if (pos.y < -0.4 && length(pos.xz) < 0.01) 
+    {
+        amount = 1;
+        velocity = float3(0, _velocity * 10,  10);
+       _Destination[id.xyz] = float4(velocity, amount);
+    } 
+    
+    else
+    {
+        _Destination[id.xyz] = _Source[id.xyz];
+    }
+}
+
+[numthreads(4, 4, 4)]
+void BoundaryCondition(uint3 id : SV_DispatchThreadID)
+{
+//    if (id.x == 0 || id.y == 0 || id.z == 0 || 
+//        id.x == _resolution -1|| id.y == _resolution -1|| id.z == _resolution -1)
+
+    if ( id.y == 0)
+        _Destination[id] = float4(0, 0, 0, 0);
+}
+
+[numthreads(4, 4, 4)]
+void Diffuse(uint3 id : SV_DispatchThreadID)
+{
+    int2 delta = int2(1, 0);
+    float4 C = _Source[id.xyz];
+    
+    float4 U = _Source[(id.xyz + delta.yxy) % _resolution];
+    float4 D = _Source[(id.xyz - delta.yxy) % _resolution];
+
+    float4 R = _Source[(id.xyz + delta.xyy) % _resolution];
+    float4 L = _Source[(id.xyz - delta.xyy) % _resolution];
+
+    float4 F = _Source[(id.xyz + delta.yyx) % _resolution];
+    float4 B = _Source[(id.xyz - delta.yyx) % _resolution];
+
+    float4 lapl = (F + B + U + D + L + R - 6.0 * C)  / 6.0;
+
+    // Diffuse veclocity not density
+    C.xyz += lapl.xyz * _viscosity;
+
+    _Destination[id.xyz] = C;
+}
+
+
+[numthreads(4, 4, 4)]
+void ProjectField(uint3 id : SV_DispatchThreadID)
+{
+    int2 delta = int2(1, 0);
+
+    float pU = _SourcePressure[(id.xyz + delta.yxy) % _resolution];
+    float pD = _SourcePressure[(id.xyz - delta.yxy) % _resolution];
+
+    float pR = _SourcePressure[(id.xyz + delta.xyy) % _resolution];
+    float pL = _SourcePressure[(id.xyz - delta.xyy) % _resolution];
+
+    float pF = _SourcePressure[(id.xyz + delta.yyx) % _resolution];
+    float pB = _SourcePressure[(id.xyz - delta.yyx) % _resolution];
+
+    float3 gradP = 0.5 * float3(pR - pL, pU - pD, pF - pB);
+
+    float4 oldField = _Source[id.xyz];
+     oldField.xyz -= gradP;
+    _Destination[id.xyz] = oldField;
+}
+
+[numthreads(4, 4, 4)]
+void Pressure(uint3 id : SV_DispatchThreadID)
+{
+    int2 delta = int2(1, 0);
+    float dC = _SourceDivergence[id.xyz];
+
+    float pU = _SourcePressure[(id.xyz + delta.yxy) % _resolution];
+    float pD = _SourcePressure[(id.xyz - delta.yxy) % _resolution];
+
+    float pR = _SourcePressure[(id.xyz + delta.xyy) % _resolution];
+    float pL = _SourcePressure[(id.xyz - delta.xyy) % _resolution];
+
+    float pF = _SourcePressure[(id.xyz + delta.yyx) % _resolution];
+    float pB = _SourcePressure[(id.xyz - delta.yyx) % _resolution];
+
+    float p = (pL + pR + pF + pB + pU + pD - dC) / 6.0;
+
+    _DestinationPressure[id.xyz] = p;
+}
+
+
+[numthreads(4, 4, 4)]
+void Divergence(uint3 id : SV_DispatchThreadID)
+{
+    int2 delta = int2(1, 0);
+    float4 C = _Source[id.xyz];
+
+    float4 U = _Source[(id.xyz + delta.yxy) % _resolution];
+    float4 D = _Source[(id.xyz - delta.yxy) % _resolution];
+
+    float4 R = _Source[(id.xyz + delta.xyy) % _resolution];
+    float4 L = _Source[(id.xyz - delta.xyy) % _resolution];
+
+    float4 F = _Source[(id.xyz + delta.yyx) % _resolution];
+    float4 B = _Source[(id.xyz - delta.yyx) % _resolution];
+
+    float div = 0.5 * ((R.x - L.x) + (U.y - D.y) + (F.z - B.z));
+
+    _DestinationDivergence[id.xyz] = div;
+}
+
+
+[numthreads(4, 4, 4)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    _DestinationPressure[id.xyz] = 0;
+}
